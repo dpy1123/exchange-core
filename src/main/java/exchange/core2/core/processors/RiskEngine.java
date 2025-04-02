@@ -181,38 +181,43 @@ public final class RiskEngine implements WriteBytesMarshallable {
     public static class LastPriceCacheRecord implements BytesMarshallable, StateHash {
         public long askPrice = Long.MAX_VALUE;
         public long bidPrice = 0L;
+        public long markPrice = 0L;
 
         public LastPriceCacheRecord() {
         }
 
-        public LastPriceCacheRecord(long askPrice, long bidPrice) {
+        public LastPriceCacheRecord(long askPrice, long bidPrice, long markPrice) {
             this.askPrice = askPrice;
             this.bidPrice = bidPrice;
+            this.markPrice = markPrice;
         }
 
         public LastPriceCacheRecord(BytesIn bytes) {
             this.askPrice = bytes.readLong();
             this.bidPrice = bytes.readLong();
+            this.markPrice = bytes.readLong();
         }
 
         @Override
         public void writeMarshallable(BytesOut bytes) {
             bytes.writeLong(askPrice);
             bytes.writeLong(bidPrice);
+            bytes.writeLong(markPrice);
         }
 
         public LastPriceCacheRecord averagingRecord() {
             LastPriceCacheRecord average = new LastPriceCacheRecord();
             average.askPrice = (this.askPrice + this.bidPrice) >> 1;
             average.bidPrice = average.askPrice;
+            average.markPrice = average.askPrice;
             return average;
         }
 
-        public static LastPriceCacheRecord dummy = new LastPriceCacheRecord(42, 42);
+        public static LastPriceCacheRecord dummy = new LastPriceCacheRecord(42, 42,42);
 
         @Override
         public int stateHash() {
-            return Objects.hash(askPrice, bidPrice);
+            return Objects.hash(askPrice, bidPrice, markPrice);
         }
     }
 
@@ -253,6 +258,23 @@ public final class RiskEngine implements WriteBytesMarshallable {
 
             case BALANCE_ADJUSTMENT:
                 if (uidForThisHandler(cmd.uid)) {
+                    final long uid = cmd.uid;
+                    final int currency = cmd.symbol;
+                    final long amountDiff = cmd.price;
+                    final UserProfile userProfile = userProfileService.getUserProfile(uid);
+                    if (userProfile == null) {
+                        cmd.resultCode = CommandResultCode.AUTH_INVALID_USER;
+                        return false;
+                    }
+                    final long currentBalance = userProfile.accounts.get(cmd.symbol);
+                    if (amountDiff < 0 && cfgMarginTradingEnabled ) {
+                        long withdrawalAmount = -amountDiff;
+                        long lockedMargin = calculateLockedMargin(userProfile, cmd.symbol);
+                        if (currentBalance - withdrawalAmount < lockedMargin) {
+                            cmd.resultCode = CommandResultCode.RISK_NSF;
+                            return false;
+                        }
+                    }
                     cmd.resultCode = adjustBalance(
                             cmd.uid, cmd.symbol, cmd.price, cmd.orderId, BalanceAdjustmentType.of(cmd.orderType.getCode()));
                 }
@@ -435,14 +457,18 @@ public final class RiskEngine implements WriteBytesMarshallable {
 
         // futures positions check for this currency
         long freeFuturesMargin = 0L;
+        long totalLockedMargin = 0L;
         if (cfgMarginTradingEnabled) {
             for (final SymbolPositionRecord position : userProfile.positions) {
                 if (position.currency == currency) {
                     final int recSymbol = position.symbol;
                     final CoreSymbolSpecification spec2 = symbolSpecificationProvider.getSymbolSpecification(recSymbol);
                     // add P&L subtract margin
+                    long requiredMarginForFutures = position.calculateRequiredMarginForFutures(spec2);
                     freeFuturesMargin +=
                             (position.estimateProfit(spec2, lastPriceCache.get(recSymbol)) - position.calculateRequiredMarginForFutures(spec2));
+                    freeFuturesMargin += (position.estimateProfit(spec2, lastPriceCache.get(recSymbol)) - requiredMarginForFutures);
+                    totalLockedMargin += requiredMarginForFutures;
                 }
             }
         }
@@ -616,9 +642,91 @@ public final class RiskEngine implements WriteBytesMarshallable {
             final RiskEngine.LastPriceCacheRecord record = lastPriceCache.getIfAbsentPut(symbol, RiskEngine.LastPriceCacheRecord::new);
             record.askPrice = (marketData.askSize != 0) ? marketData.askPrices[0] : Long.MAX_VALUE;
             record.bidPrice = (marketData.bidSize != 0) ? marketData.bidPrices[0] : 0;
+            // update markPrice, now just using avg
+            record.markPrice = (record.askPrice != Long.MAX_VALUE && record.bidPrice != 0) ? (record.askPrice + record.bidPrice) >> 1 : record.markPrice;
         }
 
         return false;
+    }
+
+    private void checkAndLiquidateAllPositions(OrderCommand cmd) {
+        userProfileService.getAllUserProfiles()
+                .filter(up -> uidForThisHandler(up.uid))
+                .filter(up -> !up.positions.isEmpty())
+                .forEach(userProfile -> {
+                    userProfile.positions.stream().forEach(position -> {
+                        int symbol = position.symbol;
+                        CoreSymbolSpecification spec = symbolSpecificationProvider.getSymbolSpecification(symbol);
+                        if (spec.type != SymbolType.FUTURES_CONTRACT) {
+                            return;
+                        }
+                        LastPriceCacheRecord priceRecord = lastPriceCache.get(symbol);
+                        if (priceRecord == null) {
+                            log.warn("No price record for symbol={}", symbol);
+                            return;
+                        }
+                        evaluateForLiquidation(cmd, userProfile, spec, priceRecord, position);
+                    });
+                });
+    }
+
+    private void evaluateForLiquidation(OrderCommand cmd, UserProfile userProfile,
+                                        CoreSymbolSpecification spec, LastPriceCacheRecord priceRecord,
+                                        SymbolPositionRecord position) {
+        if (position != null && position.direction != PositionDirection.EMPTY) {
+            long balance = userProfile.accounts.get(spec.quoteCurrency);
+            long profit = position.liquidateEstimateProfit(spec, priceRecord);
+            long locked = position.calculateRequiredMarginForFutures(spec);
+            long equity = balance + profit;
+            long maintenanceMargin = position.calculateMaintenanceMargin(spec);
+            long warningThreshold = (long) (maintenanceMargin * 1.2);
+            if (equity < maintenanceMargin) {
+                long deficit = maintenanceMargin - equity;
+                long price = position.direction == PositionDirection.LONG ? priceRecord.bidPrice : priceRecord.askPrice;
+                if (price == 0 || price == Long.MAX_VALUE) {
+                    price = position.openVolume > 0 ? position.openPriceSum / position.openVolume : priceRecord.markPrice;
+                    if (price == 0) price = 1;
+                    log.debug("Fallback to average open price={} or markPrice for symbol={}", price, position.symbol);
+                }
+                /**
+                 * calc sizeToLiquidate(x)
+                 *
+                 * find an x, where x × price ≥ deficit + x × taker_fee
+                 * x ≥ deficit / (price - taker_fee)
+                 */
+                long x = (long) Math.ceil((double) deficit / (price - spec.takerFee));
+                long sizeToLiquidate = Math.min(position.openVolume, x);
+                if (sizeToLiquidate > 0) {
+                    OrderAction action = position.direction == PositionDirection.LONG ? OrderAction.ASK : OrderAction.BID;
+                    long prevLocked = position.calculateRequiredMarginForFutures(spec);
+                    long prevProfit = position.profit;
+                    final long sizeOpen = position.updatePositionForMarginTrade(action, sizeToLiquidate, price);
+                    final long liquidationPnl = position.profit - prevProfit;
+                    locked = position.calculateRequiredMarginForFutures(spec);
+                    long releasedMargin = prevLocked - locked;
+                    long remainingPosition = position.openVolume;
+                    if (position.isEmpty()) {
+                        removePositionRecord(position, userProfile);
+                    }
+                    log.debug("Liquidated: uid={} symbol={} size={} price={} pnl={}", userProfile.uid, position.symbol, sizeToLiquidate, price,
+                            liquidationPnl);
+                }
+            }
+            else if (equity < warningThreshold) {
+                log.debug("Margin call: uid={} symbol={} equity={} threshold={}", userProfile.uid, position.symbol, equity, warningThreshold);
+            }
+        }
+    }
+
+    private long calculateLockedMargin(UserProfile userProfile, int currency) {
+        long locked = 0;
+        for (SymbolPositionRecord position : userProfile.positions) {
+            if (position.currency == currency && position.direction != PositionDirection.EMPTY) {
+                CoreSymbolSpecification spec = symbolSpecificationProvider.getSymbolSpecification(position.symbol);
+                locked += position.calculateRequiredMarginForFutures(spec);
+            }
+        }
+        return locked;
     }
 
     private void handleMatcherEventMargin(final MatcherTradeEvent ev,
@@ -629,15 +737,33 @@ public final class RiskEngine implements WriteBytesMarshallable {
         if (takerUp != null) {
             if (ev.eventType == MatcherEventType.TRADE) {
                 // update taker's position
-                final long sizeOpen = takerSpr.updatePositionForMarginTrade(takerAction, ev.size, ev.price);
-                final long fee = spec.takerFee * sizeOpen;
-                takerUp.accounts.addToValue(spec.quoteCurrency, -fee);
-                fees.addToValue(spec.quoteCurrency, fee);
+                long preVolume = takerSpr.openVolume;
+                long prePriceSum = takerSpr.openPriceSum;
+
+                final long sizeToOpen = takerSpr.closeOppositePosition(takerAction, ev.size, ev.price);
+                long closedSize = Math.max(0, preVolume - takerSpr.openVolume);
+
+                if (closedSize > 0) {
+                    long avgOpenPrice = preVolume > 0 ? prePriceSum / preVolume : 0;
+                    long closePnl = (ev.price - avgOpenPrice) * closedSize * takerSpr.direction.getMultiplier();
+                    long locked = takerSpr.calculateRequiredMarginForFutures(spec);
+                    long free = takerUp.accounts.get(spec.quoteCurrency) - locked;
+                    //send some event
+                }
+
+                if (sizeToOpen > 0) {
+                    takerSpr.openRemainingPosition(takerAction, sizeToOpen, ev.price);
+
+                    final long fee = spec.takerFee * sizeToOpen;
+                    long balance = takerUp.accounts.addToValue(spec.quoteCurrency, -fee);
+                    fees.addToValue(spec.quoteCurrency, fee);
+                    long locked = takerSpr.calculateRequiredMarginForFutures(spec);
+                    long free = balance - locked;
+                    //send some event
+                }
             } else if (ev.eventType == MatcherEventType.REJECT || ev.eventType == MatcherEventType.REDUCE) {
-                // for cancel/rejection only one party is involved
                 takerSpr.pendingRelease(takerAction, ev.size);
             }
-
             if (takerSpr.isEmpty()) {
                 removePositionRecord(takerSpr, takerUp);
             }
@@ -645,12 +771,31 @@ public final class RiskEngine implements WriteBytesMarshallable {
 
         if (ev.eventType == MatcherEventType.TRADE && uidForThisHandler(ev.matchedOrderUid)) {
             // update maker's position
-            final UserProfile maker = userProfileService.getUserProfileOrAddSuspended(ev.matchedOrderUid);
-            final SymbolPositionRecord makerSpr = maker.getPositionRecordOrThrowEx(spec.symbolId);
-            long sizeOpen = makerSpr.updatePositionForMarginTrade(takerAction.opposite(), ev.size, ev.price);
-            final long fee = spec.makerFee * sizeOpen;
-            maker.accounts.addToValue(spec.quoteCurrency, -fee);
-            fees.addToValue(spec.quoteCurrency, fee);
+            UserProfile maker = userProfileService.getUserProfileOrAddSuspended(ev.matchedOrderUid);
+            SymbolPositionRecord makerSpr = maker.getPositionRecordOrThrowEx(spec.symbolId);
+            long preVolume = makerSpr.openVolume;
+            long prePriceSum = makerSpr.openPriceSum;
+
+            final long sizeToOpen = makerSpr.closeOppositePosition(takerAction.opposite(), ev.size, ev.price);
+            long sizeClosed = Math.max(0, preVolume - makerSpr.openVolume);
+
+            if (sizeClosed > 0) {
+                long avgOpenPrice = preVolume > 0 ? prePriceSum / preVolume : ev.price;
+                long closePnl = (ev.price - avgOpenPrice) * sizeClosed * makerSpr.direction.getMultiplier();
+                long locked = makerSpr.calculateRequiredMarginForFutures(spec);
+                long free = maker.accounts.get(spec.quoteCurrency) - locked;
+            }
+
+            if (sizeToOpen > 0) {
+                makerSpr.openRemainingPosition(takerAction.opposite(), sizeToOpen, ev.price);
+
+                final long fee = spec.makerFee * sizeToOpen;
+                long balance = maker.accounts.addToValue(spec.quoteCurrency, -fee);
+                fees.addToValue(spec.quoteCurrency, fee);
+                long locked = makerSpr.calculateRequiredMarginForFutures(spec);
+                long free = balance - locked;
+
+            }
             if (makerSpr.isEmpty()) {
                 removePositionRecord(makerSpr, maker);
             }
