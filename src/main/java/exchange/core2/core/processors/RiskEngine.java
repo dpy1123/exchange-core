@@ -240,6 +240,7 @@ public final class RiskEngine implements WriteBytesMarshallable {
             case CANCEL_ORDER:
             case REDUCE_ORDER:
             case ORDER_BOOK_REQUEST:
+            case FORCE_LIQUIDATION:
                 return false;
 
             case PLACE_ORDER:
@@ -638,84 +639,17 @@ public final class RiskEngine implements WriteBytesMarshallable {
         }
 
         // Process marked data
-        if (marketData != null && cfgMarginTradingEnabled) {
-            final RiskEngine.LastPriceCacheRecord record = lastPriceCache.getIfAbsentPut(symbol, RiskEngine.LastPriceCacheRecord::new);
-            record.askPrice = (marketData.askSize != 0) ? marketData.askPrices[0] : Long.MAX_VALUE;
-            record.bidPrice = (marketData.bidSize != 0) ? marketData.bidPrices[0] : 0;
-            // update markPrice, now just using avg
-            record.markPrice = (record.askPrice != Long.MAX_VALUE && record.bidPrice != 0) ? (record.askPrice + record.bidPrice) >> 1 : record.markPrice;
+        if (cfgMarginTradingEnabled) {
+            final LastPriceCacheRecord record = lastPriceCache.getIfAbsentPut(symbol, LastPriceCacheRecord::new);
+            if (marketData != null) {
+                record.askPrice = (marketData.askSize != 0) ? marketData.askPrices[0] : Long.MAX_VALUE;
+                record.bidPrice = (marketData.bidSize != 0) ? marketData.bidPrices[0] : 0;
+                // update markPrice, now just using avg
+                record.markPrice = (record.askPrice != Long.MAX_VALUE && record.bidPrice != 0) ? (record.askPrice + record.bidPrice) >> 1 : record.markPrice;
+            }
         }
 
         return false;
-    }
-
-    private void checkAndLiquidateAllPositions(OrderCommand cmd) {
-        userProfileService.getAllUserProfiles()
-                .filter(up -> uidForThisHandler(up.uid))
-                .filter(up -> !up.positions.isEmpty())
-                .forEach(userProfile -> {
-                    userProfile.positions.stream().forEach(position -> {
-                        int symbol = position.symbol;
-                        CoreSymbolSpecification spec = symbolSpecificationProvider.getSymbolSpecification(symbol);
-                        if (spec.type != SymbolType.FUTURES_CONTRACT) {
-                            return;
-                        }
-                        LastPriceCacheRecord priceRecord = lastPriceCache.get(symbol);
-                        if (priceRecord == null) {
-                            log.warn("No price record for symbol={}", symbol);
-                            return;
-                        }
-                        evaluateForLiquidation(cmd, userProfile, spec, priceRecord, position);
-                    });
-                });
-    }
-
-    private void evaluateForLiquidation(OrderCommand cmd, UserProfile userProfile,
-                                        CoreSymbolSpecification spec, LastPriceCacheRecord priceRecord,
-                                        SymbolPositionRecord position) {
-        if (position != null && position.direction != PositionDirection.EMPTY) {
-            long balance = userProfile.accounts.get(spec.quoteCurrency);
-            long profit = position.liquidateEstimateProfit(spec, priceRecord);
-            long locked = position.calculateRequiredMarginForFutures(spec);
-            long equity = balance + profit;
-            long maintenanceMargin = position.calculateMaintenanceMargin(spec);
-            long warningThreshold = (long) (maintenanceMargin * 1.2);
-            if (equity < maintenanceMargin) {
-                long deficit = maintenanceMargin - equity;
-                long price = position.direction == PositionDirection.LONG ? priceRecord.bidPrice : priceRecord.askPrice;
-                if (price == 0 || price == Long.MAX_VALUE) {
-                    price = position.openVolume > 0 ? position.openPriceSum / position.openVolume : priceRecord.markPrice;
-                    if (price == 0) price = 1;
-                    log.debug("Fallback to average open price={} or markPrice for symbol={}", price, position.symbol);
-                }
-                /**
-                 * calc sizeToLiquidate(x)
-                 *
-                 * find an x, where x × price ≥ deficit + x × taker_fee
-                 * x ≥ deficit / (price - taker_fee)
-                 */
-                long x = (long) Math.ceil((double) deficit / (price - spec.takerFee));
-                long sizeToLiquidate = Math.min(position.openVolume, x);
-                if (sizeToLiquidate > 0) {
-                    OrderAction action = position.direction == PositionDirection.LONG ? OrderAction.ASK : OrderAction.BID;
-                    long prevLocked = position.calculateRequiredMarginForFutures(spec);
-                    long prevProfit = position.profit;
-                    final long sizeOpen = position.updatePositionForMarginTrade(action, sizeToLiquidate, price);
-                    final long liquidationPnl = position.profit - prevProfit;
-                    locked = position.calculateRequiredMarginForFutures(spec);
-                    long releasedMargin = prevLocked - locked;
-                    long remainingPosition = position.openVolume;
-                    if (position.isEmpty()) {
-                        removePositionRecord(position, userProfile);
-                    }
-                    log.debug("Liquidated: uid={} symbol={} size={} price={} pnl={}", userProfile.uid, position.symbol, sizeToLiquidate, price,
-                            liquidationPnl);
-                }
-            }
-            else if (equity < warningThreshold) {
-                log.debug("Margin call: uid={} symbol={} equity={} threshold={}", userProfile.uid, position.symbol, equity, warningThreshold);
-            }
-        }
     }
 
     private long calculateLockedMargin(UserProfile userProfile, int currency) {
