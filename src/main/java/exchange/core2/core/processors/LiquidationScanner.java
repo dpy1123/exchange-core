@@ -127,7 +127,7 @@ public final class LiquidationScanner {
                     OrderAction action = position.direction == PositionDirection.LONG ? OrderAction.ASK : OrderAction.BID;
                     CompletableFuture<OrderCommand> liquidationFuture = api.submitCommandAsyncFullResponse(ApiLiquidationOrder.builder()
                             .orderType(OrderType.IOC)
-                            .orderId(generateLiquidationOrderId(position.symbol, position.uid)) // IOC的单子不插入orderBook的
+                            .orderId(generateLiquidationOrderId(position.symbol, position.uid))
                             .uid(position.uid)
                             .symbol(position.symbol)
                             .price(price)
